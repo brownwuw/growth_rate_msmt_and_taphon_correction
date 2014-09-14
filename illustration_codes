@@ -1,0 +1,384 @@
+##############
+## Figure 1 ##
+##############
+## Setting up objects to be plotted
+r1=log(1200/200)/200
+r2=log(1400/400)/200
+r3=log(2400/400)/200
+
+Nt.mat=matrix(0,length(seq(0,200,0.001)),4)
+Nt.mat[,1]=seq(0,200,0.001)
+Nt.mat[,2]=200*exp(Nt.mat[,1]*r1)
+Nt.mat[,3]=400*exp(Nt.mat[,1]*r2)
+Nt.mat[,4]=400*exp(Nt.mat[,1]*r3)
+
+first.deriv.mat=matrix(0,length(seq(0,200,0.001)),4)
+first.deriv.mat[,1]=seq(0,200,0.001)
+first.deriv.mat[,2]=200*r1*exp(Nt.mat[,1]*r1)
+first.deriv.mat[,3]=400*r2*exp(Nt.mat[,1]*r2)
+first.deriv.mat[,4]=400*r3*exp(Nt.mat[,1]*r3)
+
+## Plotting objects
+# General plotting framework
+par(oma=c(4,2,1,2))
+figure.frame=layout(matrix(c(1,2),2,1))
+		layout.show(figure.frame)
+	time.dim=c(0,200)
+	deriv.dim=c(0,24)
+	Nt.dim=c(0,2400)
+# N(t)
+	par(mar=c(0,0,0,0))
+	plot(NULL,xlim=time.dim,ylim=Nt.dim,axes=F,xlab="",ylab="")
+	abline(v=seq(0,200,50),lty=2,col="light gray")
+	box(lwd=2)
+	for (i in 2:4){
+		lines(Nt.mat[,1],Nt.mat[,i],lty=i-1)
+	}
+	axis(2,seq(0,2400,600))
+	text(25,1800,"a: N(t)",font=2)
+# N'(t)
+	par(mar=c(0,0,0,0))
+	plot(NULL,xlim=time.dim,ylim=deriv.dim,axes=F,xlab="",ylab="")
+	abline(v=seq(0,200,50),lty=2,col="light gray")
+	box(lwd=2)
+	for (i in 2:4){
+		lines(first.deriv.mat[,1],first.deriv.mat[,i],lty=i-1)
+	}
+	axis(4,seq(0,24,6))
+	axis(1,seq(0,200,50))
+	text(25,18,"b: N'(t)",font=2)
+title(xlab="t",outer=T)
+##############
+##############
+
+
+
+
+
+
+
+
+
+
+##############
+## Figure 2 ##
+##############
+## Functions for spd and KDE generation, taphonomic inversion, and growth rate estimation
+intesum=function(n.cluster.workers,dates,calcurve){
+	# (1) Preliminary: The following operations create objects in the temporary function space that make the function more efficient and/or that will be passed into subsequent function calls.
+	# They inherit the list of 14C age estimates (SEs included) and the calibration curve specified in the higher-order function call.
+	library(parallel)
+	upper.rc.bound=max(dates[,2]+3*dates[,3])
+	clipping.index=min(which(calcurve[,2]-3*calcurve[,3]<=upper.rc.bound))
+	clipped.calcurve=calcurve[clipping.index:nrow(calcurve),]
+	rownames(clipped.calcurve)=1:nrow(clipped.calcurve)
+	cal.ages.mat=matrix(0,nrow=nrow(clipped.calcurve),ncol=nrow(dates))
+	
+	# (2) The following two functions are used to calibrate individual 14C age estimates
+	joint.prob=function(rcybp,lab.est,lab.SE,cc.ctr,cc.SD){
+		dnorm(rcybp,lab.est,lab.SE)*dnorm(rcybp,cc.ctr,cc.SD)
+	}
+
+	intecal=function(clipped.calcurve,date){
+		raw.cal=rep(0,nrow(clipped.calcurve))
+		for (i in 1:length(raw.cal)){
+			raw.cal[i]=integrate(
+				f=joint.prob,lab.est=as.numeric(date[2]),lab.SE=as.numeric(date[3]),cc.ctr=clipped.calcurve[i,2],cc.SD=clipped.calcurve[i,3],
+				lower=as.numeric(date[2])-4*as.numeric(date[3]),upper=as.numeric(date[2])+4*as.numeric(date[3])
+			)[[1]]
+		}
+		return(raw.cal/sum(raw.cal))
+	}
+
+	# (3)
+	cl=makeCluster(n.cluster.workers)
+	cal.ages.mat=parApply(cl=cl,X=dates,MARGIN=1,FUN=intecal,clipped.calcurve=clipped.calcurve)
+	stopCluster(cl)
+	raw.spd=rowSums(cal.ages.mat)
+
+	return(list(
+		spd=cbind(clipped.calcurve[,1],raw.spd/sum(raw.spd)),
+		sample.size=nrow(dates)
+	))
+}
+
+spd.KDE=function(spd.list.object,theta.1,theta.2,theta.3){
+	# (1) These preliminary operations calculate summary statistics from spd list objects to parameterize the kernel density estimate
+	CDF=cumsum(spd.list.object[[1]][,2])
+	Q1.index=which(abs(CDF-0.25)==min(abs(CDF-0.25)))
+	Q3.index=which(abs(CDF-0.75)==min(abs(CDF-0.75)))
+	Q1=spd.list.object[[1]][Q1.index,1]
+	Q3=spd.list.object[[1]][Q3.index,1]
+	IQR=Q1-Q3
+	h=theta.1*(IQR^theta.2)/(spd.list.object[[2]]^(theta.3))
+	half.h=h/2
+	max.calBP=round((spd.list.object[[1]][1,1]+3*half.h)/5)*5
+	KDE.discrete.timeline=seq(max.calBP,0,-5)
+
+	# (2)
+	kern.mat=matrix(0,nrow=nrow(spd.list.object[[1]]),ncol=length(KDE.discrete.timeline))
+	for (i in 1:nrow(kern.mat)){
+		kern.mat[i,]=exp(-abs(KDE.discrete.timeline-spd.list.object[[1]][i,1])/h)/
+			(1-0.5*exp(-spd.list.object[[1]][i,1]/h))
+	}
+
+	proportional.KDE=colSums(spd.list.object[[1]][,2]*kern.mat)
+	mass.KDE=cbind(KDE.discrete.timeline,proportional.KDE/sum(proportional.KDE))
+	return(list(
+		mass.KDE=cbind(KDE.discrete.timeline,proportional.KDE/sum(proportional.KDE)),
+		band.width=round(h,0),
+		lamda=1/h
+	))
+}
+
+Surovell.etal.survival.inversion=function(tfd.object,b,c){
+	u_t=tfd.object[[1]][,2]
+	t=tfd.object[[1]][,1]
+	prop.corrected.tfd=u_t*(1+t/b)^c
+	return(cbind(
+		t,
+		prop.corrected.tfd/sum(prop.corrected.tfd)
+	))
+}
+
+growth.record=function(tfd.object){
+	gr=rep(NA,nrow(tfd.object[[1]]))
+	for (i in 1:(nrow(tfd.object[[1]])-1)){
+		gr[i]= log(tfd.object[[1]][i+1,2]/tfd.object[[1]][i,2]) / (tfd.object[[1]][i,1]-tfd.object[[1]][i+1,1])
+	}
+	growth.record=cbind(tfd.object[[1]][,1],gr)
+	colnames(growth.record)=c("cal BP","r")
+	return(growth.record)
+}
+
+spd.plot=function(spd.list.object){
+	polygon(
+		c(spd.list.object[[1]][,1],rev(spd.list.object[[1]][,1])),
+		c(rep(0,nrow(spd.list.object[[1]])),rev(spd.list.object[[1]][,2])),
+		col="dark gray",border="black"
+	)
+}
+
+KDE.plot=function(KDE.list.object){
+	lines(KDE.list.object[[1]][,1],KDE.list.object[[1]][,2],lwd=2)
+}
+
+taphinv.plot=function(taphinv.object){
+	lines(taphinv.object[,1],taphinv.object[,2],lty=3)
+}
+
+growth.plot=function(growth.record.object){
+	lines(growth.record.object[,1],growth.record.object[,2],lwd=2)
+}
+
+taphinv.growth.plot=function(taphinv.growth.record.object){
+	lines(taphinv.growth.record.object[,1],taphinv.growth.record.object[,2],lty=3)
+}
+
+## Setting up objects to be plotted
+IntCal13=read.csv(file.choose(),header=T)
+Kod.Highconf.dates=read.csv(file.choose(),header=T)
+Kod.Highconf.spd=intesum(4,Kod.Highconf.dates,IntCal13)
+Kod.Highconf.KDE=spd.KDE(Kod.Highconf.spd,-1/log(0.05),1,1/6)
+Kod.Highconf.taphinv=Surovell.etal.survival.inversion(Kod.Highconf.KDE,b=2754,c=1.526)
+Kod.Highconf.taphinv=list(Kod.Highconf.taphinv,place.holder=0)
+Kod.Highconf.KDE.r=growth.record(Kod.Highconf.KDE)
+Kod.Highconf.taphinv.r=growth.record(Kod.Highconf.taphinv)
+
+## Plotting objects
+par(oma=c(5,1,1,1))
+	figure.frame=layout(matrix(c(1,2),2,1),heights=c(3,1))
+		layout.show(figure.frame)
+	calBPdim=c(10000,0)
+	prob.dim=c(0,0.008)
+# tfds
+	par(mar=c(0,5,0,4))
+	plot(NULL,xlim=c(10000,0),ylim=prob.dim,axes=F,xlab=NA,ylab=NA)
+	abline(v=seq(10000,0,-500),lty=2,col="light gray")
+	abline(h=0)
+	spd.plot(Kod.Highconf.spd)
+	KDE.plot(Kod.Highconf.KDE)
+	axis(2,seq(0,0.008,0.002))
+	text(
+		8000,0.006,
+		paste0(
+			"n = ",
+			Kod.Highconf.spd[[2]],
+			"\n",
+			"kernel ? = ",
+			round(Kod.Highconf.KDE[[3]],4)
+		)
+	)
+	title(ylab="probability mass\n (5-year bins)",outer=F)
+# Growth record
+	par(mar=c(0,5,0,4))
+	plot(NULL,xlim=c(10000,0),ylim=c(-0.004,0.004),axes=F,xlab=NA,ylab=NA)
+	abline(v=seq(10000,0,-500),lty=2,col="light gray")
+	abline(h=0)
+	growth.plot(Kod.Highconf.KDE.r)
+	axis(4,seq(-0.002,0.002,0.002))
+	axis(1,seq(0,10000,1000))
+	mtext("growth rate",4,3)
+title(xlab="cal BP",outer=T)
+
+
+
+
+
+
+
+
+
+
+##############
+## Figure 3 ##
+##############
+b=2754
+c=1.526
+t_a=seq(0,10000,10)
+delta_t=seq(0,10000,10)
+survival.bias=matrix(NA,nrow=length(delta_t),ncol=length(t_a))
+for (i in 1:length(delta_t)){
+	for (j in 1:length(t_a)){
+		survival.bias[i,j]=ifelse(
+			delta_t[i]>t_a[j],
+			NA,
+			log(((1+t_a[j]/b)/(1+(t_a[j]-delta_t[i])/b))^c)/delta_t[i]
+		)
+	}
+}
+
+xlab=expression('t'[a]*' (cal BP)')
+ylab=expression(Delta*'t')
+zlab=expression(gamma[P]*'[t'[a]*', t'[a]*' - '*Delta*'t]')
+
+survival.bias.surface=persp(delta_t,t_a,survival.bias,
+	xlim=c(0,10000),ylim=c(0,10000),zlim=c(0,0.001),
+	theta=225,phi=0,border=NA,
+	shade=0.9,
+	ticktype="detailed",ntick=2,
+	xlab="",ylab="",zlab=""
+)
+text(trans3d(-1500,6000,0,survival.bias.surface)[[1]],trans3d(-1500,6000,0,survival.bias.surface)[[2]],xlab)
+text(trans3d(4000,11000,0,survival.bias.surface)[[1]],trans3d(4000,11000,0,survival.bias.surface)[[2]],ylab)
+text(trans3d(13000,10000,0.0005,survival.bias.surface)[[1]],trans3d(13000,10000,0.0005,survival.bias.surface)[[2]],zlab,srt=-90)
+
+
+
+
+
+
+
+
+
+
+##############
+## Figure 4 ##
+##############
+par(oma=c(5,1,1,1))
+	figure.frame=layout(matrix(c(1,2),2,1),heights=c(3,1))
+		layout.show(figure.frame)
+	calBPdim=c(10000,0)
+	prob.dim=c(0,0.004)
+# tfds
+	par(mar=c(0,5,0,4))
+	plot(NULL,xlim=c(10000,0),ylim=prob.dim,axes=F,xlab=NA,ylab=NA)
+	abline(v=seq(10000,0,-500),lty=2,col="light gray")
+	abline(h=0)
+	KDE.plot(Kod.Highconf.KDE)
+	taphinv.plot(Kod.Highconf.taphinv[[1]])
+	axis(2,seq(0,0.004,0.002))
+	title(ylab="probability mass\n (5-year bins)",outer=F)
+# Growth record
+	par(mar=c(0,5,0,4))
+	plot(NULL,xlim=c(10000,0),ylim=c(-0.004,0.004),axes=F,xlab=NA,ylab=NA)
+	abline(v=seq(10000,0,-500),lty=2,col="light gray")
+	abline(h=0)
+	growth.plot(Kod.Highconf.KDE.r)
+	taphinv.growth.plot(Kod.Highconf.taphinv.r)
+	axis(4,seq(-0.002,0.002,0.002))
+	axis(1,seq(0,10000,1000))
+	mtext("growth rate",4,3)
+title(xlab="cal BP",outer=T)
+
+
+
+
+
+
+
+
+
+
+###############
+## Figure A1 ##
+###############
+r.interval=seq(-0.02,0.02,0.0001)
+delta.t=1:100
+
+GR_Ann.matrix=matrix(NA,nrow=length(r.interval),ncol=length(delta.t))
+for (i in 1:nrow(GR_Ann.matrix)){
+	for (j in 1:ncol(GR_Ann.matrix)){
+		GR_Ann.matrix[i,j]=((exp(r.interval[i]*delta.t[j])-1)/delta.t[j])-r.interval[i]
+	}
+}
+
+xlab=expression('r[t'[a]*',t'[a]*'+'*Delta*'t]')
+ylab=expression(Delta*'t')
+zlab=expression(Delta*'GR')
+
+('t'[a]*' (cal BP)')
+(gamma[S]*'[t'[a]*', t'[a]*' - '*Delta*'t]')
+
+GR_Ann.surface=persp(r.interval,delta.t,GR_Ann.matrix,
+	xlim=c(-0.02,0.02),ylim=c(0,100),zlim=c(0,0.05),
+	theta=-45,phi=0,border=NA,
+	shade=0.9,
+	ticktype="detailed",ntick=2,
+	xlab="",ylab="",zlab=""
+)
+text(trans3d(0,0,0,GR_Ann.surface)[[1]],trans3d(0,-55,0,GR_Ann.surface)[[2]],xlab)
+text(trans3d(-0.02,50,0,GR_Ann.surface)[[1]],trans3d(-0.04,50,0,GR_Ann.surface)[[2]],ylab)
+text(trans3d(-0.025,100,0.025,GR_Ann.surface)[[1]],trans3d(-0.025,100,0.025,GR_Ann.surface)[[2]],zlab,srt=-90)
+
+
+
+
+
+
+
+
+
+
+###############
+## Figure A2 ##
+###############
+u.t_a=100
+u.later=200
+base.delta.t=200
+GR.ann=(u.later-u.t_a)/(u.t_a*base.delta.t)
+r=log(u.later/u.t_a)/base.delta.t
+delta.t.example=0:600
+k=delta.t.example/base.delta.t
+u.t.linear=u.t_a+u.t_a*GR.ann*delta.t.example
+u.t.compounding=u.t_a*exp(r*delta.t.example)
+u.t.compounding2=u.t_a*(1+GR.ann*base.delta.t)^(delta.t.example/base.delta.t)
+
+
+plot(600:0,u.t.compounding,"l",xlim=c(600,0),xlab="cal BP",ylab="u(t)")
+	lines(600:0,u.t.linear,lty=3)
+plot(600:0,u.t.compounding,"l",xlim=c(400,0),xlab="cal BP",ylab="u(t)")
+	lines(600:0,u.t.compounding2,lty=3,col="red")
+
+
+
+
+t_a=5000
+u.t_a=100
+u.t.linear=u.t_a+GR.ann.example*delta.t
+r=log((u.t_a+GR.ann.example*200)/u.t_a)/200
+u.t.continuous=u.t_a*exp(r*delta.t)
+
+
+plot(t_a:0,u.t.linear,"l",lty=3,xlim=c(5000,0))
+lines(t_a:0,u.t.continuous)
